@@ -84,43 +84,48 @@ async fn upload(
     Extension(cfg): Extension<Arc<Config>>,
     ContentLengthLimit(mut multipart): ContentLengthLimit<Multipart, 50_000_000>,
 ) -> Json<UploadResp> {
-    let mut api_key = String::new();
-    let mut ident = String::new();
+    let mut maybe_api_key: Option<String> = None;
+    let mut maybe_ident: Option<String> = None;
 
-    let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).unwrap().keep().unwrap();
+    let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).expect("Error creating temp file").keep().unwrap();
     let mut tmp = File::from_std(tmp);
-    tmp.write_all(UP1_HEADER).await.unwrap();
+    
+    tmp.write_all(UP1_HEADER).await.expect("Error writing header");
 
-    while let Some(mut field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap();
-        if name == "api_key" {
-            api_key = field.text().await.unwrap();
-        } else if name == "ident" {
-            ident = field.text().await.unwrap();
-        } else if name == "file" {
-            while let Some(chunk) = field.chunk().await.unwrap() {
+    while let Some(mut field) = multipart.next_field().await.expect("Multipart parsing error") {
+        match field.name().unwrap().to_string().as_str()
+        {
+            "api_key" => maybe_api_key = Some(field.text().await.expect("Error getting api key")),
+            "ident" => maybe_ident = Some(field.text().await.expect("Error getting ident")),
+            "file" => while let Some(chunk) = field.chunk().await.expect("Chunk error") { // If the file field is missing it just writes an 0 byte file without error
                 tmp.write_all(&chunk).await.unwrap();
+            },
+            name => {
+                fs::remove_file(tmp_path).await.unwrap(); // TODO: We should wrap the entire thing in method with a result type which borrows temp
+                panic!("Unexpected field name {name}");
             }
-        } else {
-            fs::remove_file(tmp_path).await.unwrap();
-            panic!("Unexpected field name {name}");
         }
     }
+
+    let ident = maybe_ident.expect("Missing ident");
+    let api_key = maybe_api_key.expect("Missing API key");
 
     if api_key != cfg.api_key {
         debug!(
             "Attempted to upload '{ident}' but got API key {api_key}, expected {}",
             cfg.api_key
         );
-        fs::remove_file(tmp_path).await.unwrap();
-        Json(UploadResp::Err {
-            error: "API key doesn't match".to_string(),
-            code: 2,
-        })
+        fs::remove_file(tmp_path).await.expect("Error deleting temp file");
+        Json(
+            UploadResp::Err {
+                error: "API key doesn't match".to_string(),
+                code: 2,
+            }
+        )
     } else {
         let ident_file = Utf8Path::new(&ident);
         let ident_path = cfg.images.join(ident_file.file_name().unwrap());
-        fs::rename(tmp_path, ident_path).await.unwrap();
+        fs::rename(tmp_path, ident_path).await.expect("Rename error");
 
         let delkey = hex::encode(HMAC::mac(&cfg.delete_key, ident_file.as_str()));
         trace!("Uploaded '{ident}' ok, delkey is {delkey}");
