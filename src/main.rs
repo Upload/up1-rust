@@ -1,12 +1,13 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
-    extract::{ContentLengthLimit, Multipart, Query},
+    extract::{DefaultBodyLimit, Multipart, Query},
+    handler::Handler,
     http::StatusCode,
     response::Redirect,
-    routing::{get, get_service, post},
-    Extension, Json, Router, Server,
+    routing::{get, post},
+    Extension, Json, Router, ServiceExt,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
@@ -18,8 +19,9 @@ use thiserror::Error;
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
+    net::TcpListener,
 };
-use tower_http::services::ServeDir;
+use tower_http::{services::ServeDir, trace::TraceLayer};
 use tracing::{debug, info, trace};
 
 #[derive(Parser, Debug)]
@@ -41,37 +43,37 @@ struct Config {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
     let cfg: Arc<Config> =
-        Arc::new(Config::from_config_file(args.config).expect("Could not parse config"));
+        Arc::new(Config::from_config_file(args.config).context("Could not parse config")?);
 
-    let addr: SocketAddr = cfg.listen.parse().expect("Could not parse listen value");
+    let addr: SocketAddr = cfg.listen.parse().context("Could not parse listen value")?;
     let app = Router::new()
-        .route("/up", post(upload))
-        .route("/del", get(delete))
-        .nest(
-            "/i",
-            get_service(ServeDir::new(&cfg.images))
-                .handle_error(|_| async move { (StatusCode::INTERNAL_SERVER_ERROR, "") }),
+        .route(
+            "/up",
+            post(upload.layer(DefaultBodyLimit::max(300_000_000))),
         )
-        .fallback(
-            get_service(
-                ServeDir::new(&cfg.client)
-                    .precompressed_gzip()
-                    .precompressed_br(),
-            )
-            .handle_error(|_| async move { (StatusCode::INTERNAL_SERVER_ERROR, "") }),
+        .route("/del", get(delete))
+        .nest_service("/i", ServeDir::new(&cfg.images))
+        .fallback_service(
+            ServeDir::new(&cfg.client)
+                .precompressed_gzip()
+                .precompressed_br(),
         )
         .layer(Extension(cfg));
 
     info!("Listening on {addr}");
-    Server::bind(&addr)
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+    let listener = TcpListener::bind(addr)
         .await
-        .unwrap()
+        .context("Could not listen on {addr}")?;
+    axum::serve(listener, app.layer(TraceLayer::new_for_http()))
+        .await
+        .context("Could not serve HTTP")?;
+
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -142,10 +144,7 @@ async fn try_upload(
 }
 
 const UP1_HEADER: &[u8] = b"UP1\0";
-async fn upload(
-    Extension(cfg): Extension<Arc<Config>>,
-    ContentLengthLimit(multipart): ContentLengthLimit<Multipart, 50_000_000>,
-) -> Json<UploadResp> {
+async fn upload(Extension(cfg): Extension<Arc<Config>>, multipart: Multipart) -> Json<UploadResp> {
     let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).unwrap().keep().unwrap();
     match try_upload(File::from_std(tmp), multipart, &cfg.api_key).await {
         Ok(ident) => {
