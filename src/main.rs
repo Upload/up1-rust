@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use anyhow::{bail, Result};
 use axum::{
     extract::{ContentLengthLimit, Multipart, Query},
     http::StatusCode,
@@ -13,6 +14,7 @@ use config_file::FromConfigFile;
 use hmac_sha256::HMAC;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
+use thiserror::Error;
 use tokio::{
     fs::{self, File},
     io::AsyncWriteExt,
@@ -79,52 +81,94 @@ enum UploadResp {
     Err { error: String, code: usize },
 }
 
-const UP1_HEADER: &[u8] = b"UP1\0";
-async fn upload(
-    Extension(cfg): Extension<Arc<Config>>,
-    ContentLengthLimit(mut multipart): ContentLengthLimit<Multipart, 50_000_000>,
-) -> Json<UploadResp> {
-    let mut api_key = String::new();
-    let mut ident = String::new();
+#[derive(Error, Debug)]
+pub enum APIError {
+    #[error("API key does not match, got: {api_key}")]
+    APIKeyNoMatch { api_key: String },
+    #[error("Unexpected field name: {field_name}")]
+    UnexpectedFieldName { field_name: String },
+    #[error("Missing field: {field_name}")]
+    MissingField { field_name: String },
+}
 
-    let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).unwrap().keep().unwrap();
-    let mut tmp = File::from_std(tmp);
-    tmp.write_all(UP1_HEADER).await.unwrap();
+async fn try_upload(
+    mut file: File,
+    mut multipart: Multipart,
+    expected_api_key: &String,
+) -> Result<String> {
+    let mut maybe_api_key: Option<String> = None;
+    let mut maybe_ident: Option<String> = None;
 
-    while let Some(mut field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap();
-        if name == "api_key" {
-            api_key = field.text().await.unwrap();
-        } else if name == "ident" {
-            ident = field.text().await.unwrap();
-        } else if name == "file" {
-            while let Some(chunk) = field.chunk().await.unwrap() {
-                tmp.write_all(&chunk).await.unwrap();
+    file.write_all(UP1_HEADER).await?;
+
+    while let Some(mut field) = multipart.next_field().await? {
+        match field.name().unwrap().to_string().as_str() {
+            "api_key" => maybe_api_key = Some(field.text().await?),
+            "ident" => maybe_ident = Some(field.text().await?),
+            "file" => {
+                while let Some(chunk) = field.chunk().await? {
+                    // If the file field is missing it just writes an 0 byte file without error
+                    file.write_all(&chunk).await.unwrap();
+                }
             }
-        } else {
-            fs::remove_file(tmp_path).await.unwrap();
-            panic!("Unexpected field name {name}");
+            name => bail!(APIError::UnexpectedFieldName {
+                field_name: name.into()
+            }),
         }
     }
 
-    if api_key != cfg.api_key {
+    let api_key = match maybe_api_key {
+        Some(api_key) => api_key,
+        None => bail!(APIError::MissingField {
+            field_name: "api_key".into()
+        }),
+    };
+
+    let ident = match maybe_ident {
+        Some(ident) => ident,
+        None => bail!(APIError::MissingField {
+            field_name: "ident".into()
+        }),
+    };
+    if !api_key.eq(expected_api_key) {
         debug!(
             "Attempted to upload '{ident}' but got API key {api_key}, expected {}",
-            cfg.api_key
+            expected_api_key
         );
-        fs::remove_file(tmp_path).await.unwrap();
-        Json(UploadResp::Err {
-            error: "API key doesn't match".to_string(),
-            code: 2,
-        })
-    } else {
-        let ident_file = Utf8Path::new(&ident);
-        let ident_path = cfg.images.join(ident_file.file_name().unwrap());
-        fs::rename(tmp_path, ident_path).await.unwrap();
+        bail!(APIError::APIKeyNoMatch { api_key });
+    }
 
-        let delkey = hex::encode(HMAC::mac(&cfg.delete_key, ident_file.as_str()));
-        trace!("Uploaded '{ident}' ok, delkey is {delkey}");
-        Json(UploadResp::Ok { delkey })
+    Ok(ident)
+}
+
+const UP1_HEADER: &[u8] = b"UP1\0";
+async fn upload(
+    Extension(cfg): Extension<Arc<Config>>,
+    ContentLengthLimit(multipart): ContentLengthLimit<Multipart, 50_000_000>,
+) -> Json<UploadResp> {
+    let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).unwrap().keep().unwrap();
+    match try_upload(File::from_std(tmp), multipart, &cfg.api_key).await {
+        Ok(ident) => {
+            let ident_file = Utf8Path::new(&ident);
+            let ident_path = cfg.images.join(ident_file.file_name().unwrap());
+            fs::rename(tmp_path, ident_path).await.unwrap();
+
+            let delkey = hex::encode(HMAC::mac(&cfg.delete_key, ident_file.as_str()));
+            trace!("Uploaded '{ident}' ok, delkey is {delkey}");
+            Json(UploadResp::Ok { delkey })
+        }
+        Err(err) => {
+            fs::remove_file(tmp_path).await.unwrap();
+            match err.downcast_ref::<APIError>() {
+                Some(APIError::APIKeyNoMatch { api_key: _ }) => todo!(),
+                Some(APIError::UnexpectedFieldName { field_name: _ }) => todo!(),
+                Some(APIError::MissingField { field_name: _ }) => todo!(),
+                None => Json(UploadResp::Err {
+                    error: todo!(),
+                    code: todo!(),
+                }),
+            }
+        }
     }
 }
 
