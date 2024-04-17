@@ -5,3 +5,5 @@ result
 
 debug/
 target/
+
+client/client.json
