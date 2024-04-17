@@ -6,4 +6,6 @@ result
 debug/
 target/
 
-client/client.json
+client/config.js
+server.json
+i/
