@@ -1109,6 +1109,7 @@ dependencies = [
  "config-file",
  "hex",
  "hmac-sha256",
+ "mime",
  "serde",
  "tempfile",
  "thiserror",

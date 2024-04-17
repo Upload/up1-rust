@@ -21,14 +21,21 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
 };
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 use tracing::{debug, info, trace};
 
 #[derive(Parser, Debug)]
 struct Args {
     /// Location of config file, must end in .json
     #[clap(short, long, default_value = "./server.json")]
-    config: Utf8PathBuf,
+    server_config: Utf8PathBuf,
+
+    /// Location of client config file
+    #[clap(short, long, default_value = "./client/config.js")]
+    client_config: Utf8PathBuf,
 }
 
 #[derive(Deserialize, Debug)]
@@ -48,7 +55,7 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let cfg: Arc<Config> =
-        Arc::new(Config::from_config_file(args.config).context("Could not parse config")?);
+        Arc::new(Config::from_config_file(args.server_config).context("Could not parse config")?);
 
     let addr: SocketAddr = cfg.listen.parse().context("Could not parse listen value")?;
     let app = Router::new()
@@ -57,6 +64,10 @@ async fn main() -> Result<()> {
             post(upload.layer(DefaultBodyLimit::max(300_000_000))),
         )
         .route("/del", get(delete))
+        .route_service(
+            "/config.js",
+            ServeFile::new_with_mime(args.client_config, &mime::APPLICATION_JAVASCRIPT),
+        )
         .nest_service("/i", ServeDir::new(&cfg.images))
         .fallback_service(
             ServeDir::new(&cfg.client)
