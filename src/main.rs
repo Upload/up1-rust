@@ -5,9 +5,9 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Query},
     handler::Handler,
     http::StatusCode,
-    response::Redirect,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    Extension, Json, Router, ServiceExt,
+    Extension, Json, Router,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
@@ -91,26 +91,88 @@ pub enum APIError {
     UnexpectedFieldName { field_name: String },
     #[error("Missing field: {field_name}")]
     MissingField { field_name: String },
+    #[error("Bad delete key: {delete_key}")]
+    BadDeleteKey { delete_key: String },
+    #[error("Bad ident length: {length}")]
+    BadIdentLen { length: usize },
+    #[error("Ident already exists: {ident}")]
+    AlreadyExists { ident: String },
+}
+
+impl APIError {
+    fn to_upload_err(&self) -> UploadResp {
+        match self {
+            APIError::APIKeyNoMatch { api_key } => UploadResp::Err {
+                error: format!("API key '{api_key}' doesn't match"),
+                code: 2,
+            },
+            APIError::UnexpectedFieldName { field_name } => UploadResp::Err {
+                error: format!("Unexpected field '{field_name}'"),
+                code: 11,
+            },
+            APIError::MissingField { field_name } => UploadResp::Err {
+                error: format!("Missing field '{field_name}'"),
+                code: 12,
+            },
+            APIError::BadIdentLen { length } => UploadResp::Err {
+                error: format!("Bad ident len: {length}"),
+                code: 3,
+            },
+            APIError::AlreadyExists { ident } => UploadResp::Err {
+                error: format!("Ident '{ident}' already exists"),
+                code: 4,
+            },
+            APIError::BadDeleteKey { delete_key } => UploadResp::Err {
+                error: format!("Bad delete key '{delete_key}'"),
+                code: 10,
+            },
+        }
+    }
+}
+
+impl IntoResponse for &APIError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(self.to_upload_err())).into_response()
+    }
 }
 
 async fn try_upload(
     mut file: File,
     mut multipart: Multipart,
-    expected_api_key: &String,
-) -> Result<String> {
+    cfg: &Config,
+) -> Result<(String, String)> {
     let mut maybe_api_key: Option<String> = None;
     let mut maybe_ident: Option<String> = None;
 
     file.write_all(UP1_HEADER).await?;
 
-    while let Some(mut field) = multipart.next_field().await? {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .context("Getting next multipart field")?
+    {
         match field.name().unwrap().to_string().as_str() {
-            "api_key" => maybe_api_key = Some(field.text().await?),
-            "ident" => maybe_ident = Some(field.text().await?),
+            "api_key" => {
+                maybe_api_key = Some(
+                    field
+                        .text()
+                        .await
+                        .context("Getting API key from multipart")?,
+                )
+            }
+            "ident" => {
+                maybe_ident = Some(field.text().await.context("Getting ident from multipart")?)
+            }
             "file" => {
-                while let Some(chunk) = field.chunk().await? {
+                while let Some(chunk) = field
+                    .chunk()
+                    .await
+                    .context("Getting file chunk from multipart")?
+                {
                     // If the file field is missing it just writes an 0 byte file without error
-                    file.write_all(&chunk).await.unwrap();
+                    file.write_all(&chunk)
+                        .await
+                        .context("Writing file from multipart")?;
                 }
             }
             name => bail!(APIError::UnexpectedFieldName {
@@ -132,41 +194,57 @@ async fn try_upload(
             field_name: "ident".into()
         }),
     };
-    if !api_key.eq(expected_api_key) {
+
+    if !api_key.eq(&cfg.api_key) {
         debug!(
             "Attempted to upload '{ident}' but got API key {api_key}, expected {}",
-            expected_api_key
+            cfg.api_key
         );
         bail!(APIError::APIKeyNoMatch { api_key });
     }
 
-    Ok(ident)
+    if ident.len() != 22 {
+        debug!("Attempted to upload {ident}, but length was incorrect");
+        bail!(APIError::BadIdentLen {
+            length: ident.len()
+        });
+    }
+
+    if cfg.images.join(&ident).exists() {
+        debug!("Attempted to upload {ident}, but that ident already exists");
+        bail!(APIError::AlreadyExists { ident });
+    }
+
+    let delkey = hex::encode(HMAC::mac(&cfg.delete_key, &ident));
+    trace!("Uploaded '{ident}' ok, delkey is {delkey}");
+
+    Ok((ident, delkey))
 }
 
 const UP1_HEADER: &[u8] = b"UP1\0";
-async fn upload(Extension(cfg): Extension<Arc<Config>>, multipart: Multipart) -> Json<UploadResp> {
+async fn upload(Extension(cfg): Extension<Arc<Config>>, multipart: Multipart) -> Response {
     let (tmp, tmp_path) = NamedTempFile::new_in(&cfg.images).unwrap().keep().unwrap();
-    match try_upload(File::from_std(tmp), multipart, &cfg.api_key).await {
-        Ok(ident) => {
+    match try_upload(File::from_std(tmp), multipart, &cfg).await {
+        Ok((ident, delkey)) => {
             let ident_file = Utf8Path::new(&ident);
+
             let ident_path = cfg.images.join(ident_file.file_name().unwrap());
             fs::rename(tmp_path, ident_path).await.unwrap();
 
-            let delkey = hex::encode(HMAC::mac(&cfg.delete_key, ident_file.as_str()));
-            trace!("Uploaded '{ident}' ok, delkey is {delkey}");
-            Json(UploadResp::Ok { delkey })
+            Json(UploadResp::Ok { delkey }).into_response()
         }
         Err(err) => {
             fs::remove_file(tmp_path).await.unwrap();
-            match err.downcast_ref::<APIError>() {
-                Some(APIError::APIKeyNoMatch { api_key: _ }) => todo!(),
-                Some(APIError::UnexpectedFieldName { field_name: _ }) => todo!(),
-                Some(APIError::MissingField { field_name: _ }) => todo!(),
-                None => Json(UploadResp::Err {
-                    error: todo!(),
-                    code: todo!(),
-                }),
-            }
+            err.downcast_ref::<APIError>()
+                .map(|x| x.into_response())
+                .unwrap_or_else(|| {
+                    info!("Unknown error occurred: '{}' '{:?}'", err, err);
+                    Json(UploadResp::Err {
+                        error: format!("Unknown error: '{err}'"),
+                        code: 99,
+                    })
+                    .into_response()
+                })
         }
     }
 }
@@ -177,25 +255,48 @@ struct DeleteQueryParams {
     delkey: String,
 }
 
+async fn try_delete(cfg: &Config, ident: &str, delete_key: &str) -> Result<()> {
+    if ident.len() != 22 {
+        debug!("Attempted to upload {ident}, but length was incorrect");
+        bail!(APIError::BadIdentLen {
+            length: ident.len(),
+        });
+    }
+
+    let expected_delete_key = hex::encode(HMAC::mac(&cfg.delete_key, ident));
+    if delete_key != expected_delete_key {
+        debug!(
+            "Delete from {ident} with {delete_key} failed, expected key {}",
+            cfg.delete_key
+        );
+        bail!(APIError::BadDeleteKey {
+            delete_key: delete_key.to_string()
+        });
+    }
+
+    let ident_path = cfg.images.join(ident);
+    trace!("Delete from {ident_path} with {delete_key} ok");
+    fs::remove_file(ident_path).await.unwrap();
+
+    Ok(())
+}
+
 async fn delete(
     Extension(cfg): Extension<Arc<Config>>,
     Query(params): Query<DeleteQueryParams>,
-) -> Redirect {
-    let ident = Utf8Path::new(&params.ident);
-    let delkey = hex::encode(HMAC::mac(&cfg.delete_key, ident.as_str()));
-    if delkey == params.delkey {
-        let ident_path = cfg.images.join(ident);
-        trace!(
-            "Delete from {} with {} ok",
-            ident_path.as_str(),
-            params.delkey
-        );
-        fs::remove_file(ident_path).await.unwrap();
-    } else {
-        debug!(
-            "Delete from {ident} with {} failed, expected key {delkey}",
-            params.delkey
-        );
+) -> Response {
+    match try_delete(&cfg, &params.ident, &params.delkey).await {
+        Ok(_) => Redirect::to("/").into_response(),
+        Err(err) => err
+            .downcast_ref::<APIError>()
+            .map(|x| x.into_response())
+            .unwrap_or_else(|| {
+                info!("Unknown error occurred: '{}' '{:?}'", err, err);
+                Json(UploadResp::Err {
+                    error: format!("Unknown error: '{err}'"),
+                    code: 99,
+                })
+                .into_response()
+            }),
     }
-    Redirect::to("/")
 }
